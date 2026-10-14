@@ -129,6 +129,8 @@ sequenceDiagram
 | [`rules.md`](rules.md) | One review rule per line. Edit to match your standards. |
 | [`buaji.sandbox.Dockerfile`](buaji.sandbox.Dockerfile) | Sandbox template: `docker/sandbox-templates:shell` + `python3`, `python3-requests`, `git` baked in, so the sandbox needs no internet of its own. |
 | [`scripts/verify-cves.sh`](scripts/verify-cves.sh) | Fails the review if it cites a CVE that does not exist in NVD. |
+| [`scripts/mock-ollama.py`](scripts/mock-ollama.py) | Tiny stand-in for Ollama, so you can test the plumbing without a GPU or a model. |
+| [`scripts/test-sandbox.sh`](scripts/test-sandbox.sh) | One-command end-to-end self-test of the whole sandbox setup. |
 | [`.gitlab-ci.yml`](.gitlab-ci.yml) | The full pipeline. The `buaji` job runs the review inside an `sbx` microVM. |
 | `main.go`, `go.mod` | A tiny Go service — the thing being reviewed. |
 
@@ -194,6 +196,34 @@ exist, it fails the job:
 It runs on the runner, outside the sandbox, so BuaJi cannot skip it. It won't
 catch every invented detail (a fake Kubernetes resource name, say), but it
 catches the one that holds most fabricated reports together.
+
+---
+
+## Testing
+
+The fastest way to validate the whole sandbox setup — **no GPU, no model
+download** — is the self-test. It builds the template, runs BuaJi inside a
+microVM against a throwaway Go project, and asserts every guarantee: the code is
+read-only, there is no `kubectl`/`terraform`, the model port is denied by
+default and reachable only after a scoped allow, the review runs, and the CVE
+gate accepts a clean report. It is fully isolated (dedicated sandbox name and a
+non-default mock port) and cleans up after itself.
+
+```bash
+./scripts/test-sandbox.sh
+# == Result: 6 passed, 0 failed
+```
+
+The CVE gate alone (needs internet for NVD):
+
+```bash
+printf 'CVE-2026-99999 (fake), CVE-2021-44228 (real)\n' > /tmp/review.log
+./scripts/verify-cves.sh /tmp/review.log   # flags the fake, exit 1
+```
+
+> **macOS / zsh note:** when mounting a workspace read-only, brace the path —
+> `"${PWD}:ro"`, not `"$PWD:ro"`. Unbraced, zsh applies the `:r` history
+> modifier and silently mangles the path. The scripts here already do this.
 
 ---
 
