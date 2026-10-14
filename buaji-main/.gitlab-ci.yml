@@ -1,0 +1,114 @@
+stages:
+- lint
+- build
+- test
+- dockerImage
+- deploy
+- buaji
+
+
+lint:
+  stage: lint
+  image: registry.gitlab.com/pipeline-components/go-lint:latest
+  script:
+    - golint ./...
+    - echo "Code is well formatted!"
+  allow_failure: false
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .cache/golint
+  only:
+    changes:
+      - "**/*.go"
+
+build:
+  stage: build
+  image: golang:1.23
+  script:
+    - go build -o myapp
+    - echo "Build completed!"
+  allow_failure: false
+  only:
+    changes:
+      - "**/*.go"
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .cache/go-build
+      - vendor/
+
+test:
+  stage: test
+  image: golang:1.23
+  script:
+  - go test -v
+  - echo "Tests completed!"
+  allow_failure: false
+  only:
+    changes:
+      - "**/*.go"  
+
+dockerImage:
+  stage: dockerImage
+  image: docker:24.0.5
+  services:
+  - docker:24.0.5-dind
+  before_script:
+  - docker info
+  script:
+  - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  - docker build -t $CI_REGISTRY_IMAGE:1.0.$CI_PIPELINE_ID .
+  - docker push $CI_REGISTRY_IMAGE:1.0.$CI_PIPELINE_ID
+  - echo "Image built and published!"
+  allow_failure: false
+
+
+sast:
+  stage: test
+include:
+- template: Security/SAST.gitlab-ci.yml
+- template: Jobs/Container-Scanning.gitlab-ci.yml
+container_scanning:
+  variables:
+    CS_IMAGE: $CI_REGISTRY_IMAGE:1.0.$CI_PIPELINE_ID
+  allow_failure: true
+    
+deploy:
+  stage: deploy
+  script:
+  - echo "Deploying to production server"
+  - echo "Deployed successfully!"
+  allow_failure: false
+
+buaji:
+  stage: buaji
+  tags:
+    - saas-linux-medium-amd64-gpu-standard
+  image: nvcr.io/nvidia/cuda:12.1.1-base-ubuntu22.04
+  variables:
+    # Define the LLM variable
+    LLM: ${CI_ENVIRONMENT_VARIABLE:gemma}  # Default to 'gemma' if not set
+
+  # Conditional logic for Ollama run command
+  before_script:
+    - |
+      if [[ -z "$LLM" ]]; then
+        export LLM="gemma"
+        echo "LLM variable not set, using default: gemma"
+      else
+        echo "Using LLM: $LLM"
+      fi
+  script:
+    - apt-get update && apt-get install -y curl git python3 python3-pip || true
+    - pip3 install requests || true
+    - curl -fsSL https://ollama.com/install.sh | sh 
+    - &ollama_serve  # Define a reusable step for ollama serve
+      ollama serve &
+    - sleep 2s  # Wait for 5 seconds
+    - bash -c "ollama run $LLM --keepalive 15m --nowordwrap"  # Use bash to run ollama run in a subshell
+    - python3 buaji.py
+  allow_failure: true
+  only:
+    changes:
+      - "**/*.go"
