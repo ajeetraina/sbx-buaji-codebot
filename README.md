@@ -1,107 +1,227 @@
-# BuaJi
+# BuaJi 🧐 — AI code review, contained
 
-🚀 Introducing BuaJi - AI-Powered Code Reviews for CI/CD Pipelines
+BuaJi is a small, self-hosted AI code reviewer for CI/CD pipelines. On every
+push it reads what changed and writes a first-pass review into the pipeline —
+the same kind of comment a human teammate would leave before a person looks at
+the change.
 
-Built an intelligent code review automation tool that integrates seamlessly into CI/CD workflows. BuaJi analyzes code changes against customizable rules using AI, helping teams maintain code quality standards automatically.
-✨ Key Features:
+> In India, your *bua* is your father's sister — the relative who inspects
+> everything you do and always finds something wrong with it. A fitting name
+> for a code reviewer.
 
-- Multi-LLM Support: Compatible with both API-based models and open-source Ollama LLMs (Gemma, Llama, etc.)
-- Git Integration: Automatically detects changed files in commits using Git diff
-- Custom Rule Engine: Define your own coding standards via rules.md configuration
-- CI/CD Ready: Perfect for GitHub Actions, GitLab CI, Jenkins pipelines
-- Language Support: Currently optimized for Go codebases with extensible architecture
-- Retry Logic: Robust error handling with configurable retry mechanisms
+BuaJi runs local models through **Ollama**, so the code it reads never leaves
+your infrastructure. This repo also shows how to **contain** BuaJi inside a
+[Docker Sandbox](https://docs.docker.com/ai/sandboxes/) so that its read-only
+promise is enforced by the environment, not by a convention in the script.
 
-Built with Python, leveraging REST APIs and subprocess management for seamless Git operations. The tool provides boolean rule validation with detailed feedback, making code reviews consistent and scalable across development teams.
+This is the companion code for the blog *"Coding Agent Horror Stories: The CVE
+That Did Not Exist."* The story's point: a read-only agent that only writes
+comments can still get your cluster taken down — because it can *tell a human*
+to run commands it was never allowed to run itself. Containment handles one half
+of that; a CVE-verification gate and a careful reader handle the other.
 
+---
 
+## What BuaJi does
 
-## Getting started
+- Reads review rules from [`rules.md`](rules.md)
+- Finds changed files with `git diff HEAD^ HEAD --name-only`
+- Sends each changed Go file + each rule to a local Ollama model
+- Prints a pass/fail-style review to the CI log
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+It **cannot** run `terraform apply`, `kubectl apply`, or push a commit. In the
+sandboxed setup it also cannot reach the cluster, your cloud APIs, or GitLab —
+and it cannot write to your source at all.
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+---
 
-## Add your files
+## Architecture
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/ee/gitlab-basics/add-file.html#add-a-file-using-the-command-line) or push an existing Git repository with the following command:
+### Before: everything in one container
 
+Originally the job ran everything — the model, the script, the checkout, and
+every CI variable including `CI_JOB_TOKEN` — in a single container. BuaJi was
+"read-only" only because the script happened not to write anything. The
+restriction lived in habit, one rushed change away from disappearing.
+
+```mermaid
+flowchart TB
+    subgraph container["CI Runner — one shared container"]
+        direction TB
+        script["buaji.py"]
+        model["Ollama model"]
+        checkout["Repo checkout<br/>(read + write)"]
+        creds["CI_JOB_TOKEN · kubeconfig<br/>cloud credentials"]
+    end
+    script -->|prompts| model
+    script -->|reads &amp; could write| checkout
+    script -.->|can see| creds
+
+    classDef danger fill:#ffe1e1,stroke:#d33,color:#900;
+    class creds,checkout danger;
 ```
-cd existing_repo
-git remote add origin https://gitlab.com/kitarp29/buaji.git
-git branch -M main
-git push -uf origin main
+
+### After: BuaJi in a Docker Sandbox
+
+Now the model stays on the runner next to the GPU, and BuaJi moves into an
+isolated microVM that can read the code, talk to the model, and nothing else.
+The code is mounted **read-only**, no credentials are passed in, and exactly one
+network path — to the model — is open. Everything BuaJi writes is just text,
+and that text is checked on the way out.
+
+```mermaid
+flowchart LR
+    subgraph host["CI Runner (host)"]
+        ollama["Ollama + GPU"]
+        verify["verify-cves.sh"]
+        nvd["NVD registry"]
+        reviewlog["buaji-review.log"]
+    end
+
+    subgraph vm["Docker Sandbox — microVM"]
+        buaji["buaji.py"]
+        code["Repo mounted :ro"]
+        scratch["scratch (rw)"]
+    end
+
+    deny["Kubernetes · cloud APIs · GitLab"]
+
+    buaji -->|read only| code
+    buaji -->|writes to| scratch
+    buaji -->|"OLLAMA_URL<br/>host.docker.internal:11434<br/>(only open port)"| ollama
+    buaji -->|stdout| reviewlog
+    reviewlog --> verify
+    verify <-->|check every CVE id| nvd
+    buaji -. "denied by default" .-> deny
+
+    classDef danger fill:#ffe1e1,stroke:#d33,color:#900;
+    class deny danger;
 ```
 
-## Integrate with your tools
+### Pipeline flow
 
-- [ ] [Set up project integrations](https://gitlab.com/kitarp29/buaji/-/settings/integrations)
+```mermaid
+sequenceDiagram
+    participant R as Runner
+    participant O as Ollama (runner)
+    participant S as Sandbox (microVM)
+    participant N as NVD
 
-## Collaborate with your team
+    R->>O: ollama serve + pull model
+    R->>S: sbx run (code :ro, scratch rw, no creds)
+    R->>S: sbx policy allow network localhost:11434
+    Note over S: buaji.py reads diff + rules (:ro)
+    S->>O: review prompts (only open path)
+    O-->>S: responses
+    S-->>R: review piped to buaji-review.log
+    R->>N: verify every CVE id
+    N-->>R: exists? / not found -> fail job
+    R->>S: policy log, stop, rm
+```
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/ee/user/project/merge_requests/merge_when_pipeline_succeeds.html)
+---
 
-## Test and Deploy
+## Repository layout
 
-Use the built-in continuous integration in GitLab.
+| File | Role |
+|------|------|
+| [`buaji.py`](buaji.py) | The reviewer. Reads `OLLAMA_URL` (default `http://localhost:11434`) so it can reach the model from inside a sandbox. |
+| [`rules.md`](rules.md) | One review rule per line. Edit to match your standards. |
+| [`buaji.sandbox.Dockerfile`](buaji.sandbox.Dockerfile) | Sandbox template: `docker/sandbox-templates:shell` + `python3`, `python3-requests`, `git` baked in, so the sandbox needs no internet of its own. |
+| [`scripts/verify-cves.sh`](scripts/verify-cves.sh) | Fails the review if it cites a CVE that does not exist in NVD. |
+| [`.gitlab-ci.yml`](.gitlab-ci.yml) | The full pipeline. The `buaji` job runs the review inside an `sbx` microVM. |
+| `main.go`, `go.mod` | A tiny Go service — the thing being reviewed. |
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/index.html)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+---
 
-***
+## Running it
 
-# Editing this README
+### Locally (unsandboxed)
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+```bash
+ollama serve &
+ollama pull gemma
+LLM=gemma python3 buaji.py        # reviews .go files changed in HEAD^..HEAD
+```
 
-## Suggestions for a good README
+### In CI, inside a Docker Sandbox
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+The `buaji` job in [`.gitlab-ci.yml`](.gitlab-ci.yml) does this on a self-hosted
+runner (GPU for Ollama, KVM for the microVMs). The moving parts:
 
-## Name
-Choose a self-explaining name for your project.
+1. **Point BuaJi at the model via env.** Inside a sandbox `localhost` is the
+   sandbox itself, so `buaji.py` reads `OLLAMA_URL` and defaults to the old value.
+2. **Bake dependencies into a template once** (`buaji.sandbox.Dockerfile`),
+   push it to your registry, store the name in `BUAJI_TEMPLATE`.
+3. **Keep the model on the runner** next to the GPU.
+4. **Create the sandbox with the code mounted read-only:**
+   ```bash
+   sbx run -d --name "$SBX_NAME" -t "$BUAJI_TEMPLATE" \
+     shell "$CI_BUILDS_DIR/buaji-scratch" "$CI_PROJECT_DIR:ro"
+   ```
+   No GitLab token, no kubeconfig, no cloud credentials are passed in.
+5. **Open exactly one network path — to the model:**
+   ```bash
+   sbx policy allow network --sandbox "$SBX_NAME" localhost:11434
+   ```
+6. **Run the review**, pointing it at the runner's Ollama:
+   ```bash
+   sbx exec -w "$CI_PROJECT_DIR" \
+     -e LLM="$LLM" -e OLLAMA_URL=http://host.docker.internal:11434 \
+     "$SBX_NAME" python3 buaji.py | tee buaji-review.log
+   ```
+7. **Verify every CVE** the review mentions (see below).
+8. **Audit and clean up:** `sbx policy log` shows every host BuaJi tried to
+   reach; a healthy run shows only the model on port `11434`. Then `sbx stop`
+   and `sbx rm`.
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+---
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+## The CVE gate
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+A fabricated security finding often hangs its whole argument on a single CVE
+number — and a CVE number is one of the easiest things in security to verify.
+[`scripts/verify-cves.sh`](scripts/verify-cves.sh) greps every `CVE-…` id out of
+the review and looks each one up in the public NVD registry. If any do not
+exist, it fails the job:
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+```bash
+./scripts/verify-cves.sh buaji-review.log
+# ⚠️ BuaJi output mentions CVE IDs that do not exist: CVE-2026-99999
+# ⚠️ Treat this review as unverified. Do not run any commands it suggests.
+```
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+It runs on the runner, outside the sandbox, so BuaJi cannot skip it. It won't
+catch every invented detail (a fake Kubernetes resource name, say), but it
+catches the one that holds most fabricated reports together.
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+---
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+## What the sandbox does — and does not — protect
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+A sandbox is not a fact-checker. **It will not stop a model from making things
+up.** What it changes is what that fabricated output can *do*: the microVM has
+its own kernel and filesystem, the code is read-only, and the network denies
+everything except the one path you opened. The read-only rule stops being
+something a person has to remember and becomes a property of the environment.
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+Two things it does **not** handle, worth stating plainly:
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+- **The human who reads the output.** No sandbox makes a review accurate.
+  Treat an agent's security finding as a hypothesis, label it clearly as agent
+  output, and never run agent-written remediation without reviewing it first.
+- **Your runner's defaults.** "Denies everything by default" assumes the
+  runner's default network policy is **deny-all / locked-down**. On a balanced
+  or open policy, common dev hosts stay reachable regardless of this job — so
+  set the runner default to deny-all and let this job open only `localhost:11434`.
+  Likewise, if the operator has global `sbx secret`s configured, placeholder
+  credential env vars may be injected; raw values never enter the VM and the
+  network policy still blocks the services they belong to, but a clean CI runner
+  (with no personal secrets) is the intended environment.
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+---
 
-## License
-For open source projects, say how it is licensed.
+## Credits
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+Built by Pratik Kumar Singh. Sandboxing write-up and hardening by the Docker
+team. Companion to the *AI Coding Agent Horror Stories* series.
