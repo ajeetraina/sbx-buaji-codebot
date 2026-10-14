@@ -1,0 +1,112 @@
+stages:
+  - lint
+  - build
+  - test
+  - dockerImage
+  - deploy
+  - buaji
+
+lint:
+  stage: lint
+  image: registry.gitlab.com/pipeline-components/go-lint:latest
+  script:
+    - golint ./...
+    - echo "Code is well formatted!"
+  allow_failure: false
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .cache/golint
+  only:
+    changes:
+      - "**/*.go"
+
+build:
+  stage: build
+  image: golang:1.23
+  script:
+    - go build -o myapp
+    - echo "Build completed!"
+  allow_failure: false
+  only:
+    changes:
+      - "**/*.go"
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .cache/go-build
+      - vendor/
+
+test:
+  stage: test
+  image: golang:1.23
+  script:
+    - go test -v
+    - echo "Tests completed!"
+  allow_failure: false
+  only:
+    changes:
+      - "**/*.go"
+
+dockerImage:
+  stage: dockerImage
+  image: docker:24.0.5
+  services:
+    - docker:24.0.5-dind
+  before_script:
+    - docker info
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker build -t $CI_REGISTRY_IMAGE:1.0.$CI_PIPELINE_ID .
+    - docker push $CI_REGISTRY_IMAGE:1.0.$CI_PIPELINE_ID
+    - echo "Image built and published!"
+  allow_failure: false
+
+sast:
+  stage: test
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Jobs/Container-Scanning.gitlab-ci.yml
+container_scanning:
+  variables:
+    CS_IMAGE: $CI_REGISTRY_IMAGE:1.0.$CI_PIPELINE_ID
+  allow_failure: true
+
+deploy:
+  stage: deploy
+  script:
+    - echo "Deploying to production server"
+    - echo "Deployed successfully!"
+  allow_failure: false
+
+# BuaJi, moved into a Docker Sandbox. The read-only rule is now a property of
+# the environment, not a convention in the script: the code is mounted :ro, no
+# credentials are passed in, and only one network path (to the model) is open.
+buaji:
+  stage: buaji
+  tags:
+    - self-hosted-gpu-kvm   # GPU for Ollama, KVM for sbx microVMs
+  variables:
+    LLM: gemma
+    GIT_DEPTH: "2"          # buaji.py diffs HEAD^ against HEAD
+    SBX_NAME: buaji-$CI_PIPELINE_ID
+  before_script:
+    - ollama serve > /tmp/ollama.log 2>&1 &
+    - sleep 2
+    - ollama pull "$LLM"
+    - mkdir -p "$CI_BUILDS_DIR/buaji-scratch"
+    - sbx run -d --name "$SBX_NAME" -t "$BUAJI_TEMPLATE"
+        shell "$CI_BUILDS_DIR/buaji-scratch" "$CI_PROJECT_DIR:ro"
+    - sbx policy allow network --sandbox "$SBX_NAME" localhost:11434
+  script:
+    - sbx exec -w "$CI_PROJECT_DIR"
+        -e LLM="$LLM" -e OLLAMA_URL=http://host.docker.internal:11434
+        "$SBX_NAME" python3 buaji.py | tee buaji-review.log
+    - ./scripts/verify-cves.sh buaji-review.log
+  after_script:
+    - sbx policy log "$SBX_NAME"
+    - sbx stop "$SBX_NAME" && sbx rm "$SBX_NAME"
+  allow_failure: true
+  only:
+    changes:
+      - "**/*.go"

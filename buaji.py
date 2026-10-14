@@ -7,7 +7,10 @@ import os
 
 # Function to send a prompt to the LLM and return the response.
 def send_prompt_to_llm(prompt, model_name="gemma", max_retries=2, retry_delay=1):
-    url = "http://localhost:11434/api/generate"
+    # Inside a sandbox, localhost is the sandbox itself, so read the Ollama
+    # address from an environment variable and keep the old value as default.
+    base = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+    url = f"{base}/api/generate"
     headers = {"Content-Type": "application/json"}
     data = json.dumps({"model": model_name, "prompt": prompt, "response_format": "json", "stream": False})
 
